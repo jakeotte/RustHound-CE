@@ -1467,6 +1467,7 @@ dependencies = [
  "nom",
  "obfstr",
  "once_cell",
+ "rand",
  "regex",
  "rpassword",
  "serde",

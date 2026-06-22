@@ -31,6 +31,10 @@ pub struct Options {
     pub cache: bool,
     pub cache_buffer_size: usize,
     pub resume: bool,
+
+    pub obfuscated: bool,
+    pub jitter_min_ms: u64,
+    pub jitter_max_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -178,6 +182,27 @@ fn cli() -> Command {
         .required(false)
         .action(ArgAction::SetTrue)
     )
+    .arg(Arg::new("obfuscated")
+        .long("obfuscated")
+        .help("OPSEC-safe collection: replaces broad LDAP filters with targeted per-type queries, reduces page size to 200, and adds random jitter between queries. Overrides --ldap-filter.")
+        .required(false)
+        .action(ArgAction::SetTrue)
+        .global(false)
+    )
+    .arg(Arg::new("jitter-min")
+        .long("jitter-min")
+        .help("Minimum jitter in milliseconds between queries in obfuscated mode [default: 500]")
+        .required(false)
+        .value_parser(value_parser!(u64))
+        .default_value("500")
+    )
+    .arg(Arg::new("jitter-max")
+        .long("jitter-max")
+        .help("Maximum jitter in milliseconds between queries in obfuscated mode [default: 3000]")
+        .required(false)
+        .value_parser(value_parser!(u64))
+        .default_value("3000")
+    )
     .next_help_heading("OPTIONAL MODULES")
     .arg(Arg::new("fqdn-resolver")
         .long("fqdn-resolver")
@@ -262,6 +287,16 @@ pub fn extract_args() -> Options {
         .unwrap_or(1000);
     let resume = matches.get_flag("resume");
 
+    let obfuscated = matches.get_flag("obfuscated");
+    let jitter_min_ms = matches
+        .get_one::<u64>("jitter-min")
+        .copied()
+        .unwrap_or(500);
+    let jitter_max_ms = matches
+        .get_one::<u64>("jitter-max")
+        .copied()
+        .unwrap_or(3000);
+
     // Return all
     Options {
         domain: d.to_string(),
@@ -283,6 +318,9 @@ pub fn extract_args() -> Options {
         cache,
         cache_buffer_size,
         resume,
+        obfuscated,
+        jitter_min_ms,
+        jitter_max_ms,
     }
 }
 
@@ -345,5 +383,8 @@ pub fn auto_args() -> Options {
         cache: false,
         cache_buffer_size: 1000,
         resume: false,
+        obfuscated: false,
+        jitter_min_ms: 500,
+        jitter_max_ms: 3000,
     }
 }

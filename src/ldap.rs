@@ -20,11 +20,205 @@ use indicatif::ProgressBar;
 use ldap3::adapters::{Adapter, EntriesOnly};
 use ldap3::{adapters::PagedResults, controls::RawControl, LdapConnAsync, LdapConnSettings};
 use ldap3::{Scope, SearchEntry};
-use log::{info, debug, error, trace};
+use log::{info, debug, warn, error, trace};
+use rand::Rng;
+use rand::seq::SliceRandom;
 use std::io::{self, Write, stdin};
 use std::collections::HashMap;
 use std::error::Error;
 use std::process;
+
+/// Pairs an LDAP filter with the exact attributes that object type needs and whether the
+/// SD control is required. Keeping attributes tight avoids requesting `*` (anomalous) while
+/// guaranteeing every field the parsers use is returned.
+struct FilterConfig {
+    filter: &'static str,
+    attrs: &'static [&'static str],
+    /// Whether to apply LDAP_SERVER_SD_FLAGS_OID (1.2.840.113556.1.4.801).
+    /// Only set for types whose parser reads nTSecurityDescriptor.
+    needs_sd_control: bool,
+}
+
+/// Per-type configs for the main domain naming context.
+/// Filters are non-overlapping: the user filter excludes computers via `!(objectClass=computer)`,
+/// and the computer filter excludes MSAs via `!(objectClass=msDS-GroupManagedServiceAccount)`.
+/// This prevents any object from appearing in two result sets.
+const OBFUSCATED_MAIN_CONFIGS: &[FilterConfig] = &[
+    FilterConfig {
+        filter: "(&(objectClass=user)(!(objectClass=computer)))",
+        attrs: &[
+            "objectClass",
+            "sAMAccountName", "description", "mail", "title", "displayName",
+            "adminCount", "homeDirectory", "scriptpath", "userAccountControl",
+            "msDS-AllowedToDelegateTo", "lastLogon", "lastLogonTimestamp",
+            "pwdLastSet", "whenCreated", "servicePrincipalName", "primaryGroupID",
+            "msDS-SupportedEncryptionTypes", "IsDeleted",
+            "userPassword", "unixUserPassword", "unicodepwd", "sfupassword",
+            "objectSid", "nTSecurityDescriptor", "sIDHistory",
+            "msDS-GroupMSAMembership", "userCertificate",
+        ],
+        needs_sd_control: true,
+    },
+    FilterConfig {
+        // MSAs: objectClass=computer excludes them from user filter; separate query returns
+        // them correctly. get_type() maps msDS-GroupManagedServiceAccount → User.
+        filter: "(objectClass=msDS-GroupManagedServiceAccount)",
+        attrs: &[
+            "objectClass",
+            "sAMAccountName", "description", "mail", "title", "displayName",
+            "adminCount", "homeDirectory", "scriptpath", "userAccountControl",
+            "msDS-AllowedToDelegateTo", "lastLogon", "lastLogonTimestamp",
+            "pwdLastSet", "whenCreated", "servicePrincipalName", "primaryGroupID",
+            "msDS-SupportedEncryptionTypes", "IsDeleted",
+            "userPassword", "unixUserPassword", "unicodepwd", "sfupassword",
+            "objectSid", "nTSecurityDescriptor", "sIDHistory",
+            "msDS-GroupMSAMembership", "userCertificate",
+        ],
+        needs_sd_control: true,
+    },
+    FilterConfig {
+        filter: "(&(objectClass=computer)(!(objectClass=msDS-GroupManagedServiceAccount)))",
+        attrs: &[
+            "objectClass",
+            "name", "sAMAccountName", "dNSHostName", "description", "operatingSystem",
+            "lastLogon", "lastLogonTimestamp", "pwdLastSet", "whenCreated",
+            "servicePrincipalName", "userAccountControl", "msDS-AllowedToDelegateTo",
+            "ms-Mcs-AdmPwd", "ms-Mcs-AdmPwdExpirationTime",
+            "msLAPS-Password", "msLAPS-EncryptedPassword", "msLAPS-PasswordExpirationTime",
+            "primaryGroupID", "msDS-SupportedEncryptionTypes", "IsDeleted",
+            "objectSid", "nTSecurityDescriptor", "msDS-AllowedToActOnBehalfOfOtherIdentity",
+        ],
+        needs_sd_control: true,
+    },
+    FilterConfig {
+        filter: "(objectClass=group)",
+        attrs: &[
+            "objectClass",
+            "name", "description", "adminCount", "sAMAccountName",
+            "member", "whenCreated", "IsDeleted",
+            "objectSid", "nTSecurityDescriptor",
+        ],
+        needs_sd_control: true,
+    },
+    FilterConfig {
+        filter: "(objectClass=organizationalUnit)",
+        attrs: &[
+            "objectClass",
+            "name", "description", "whenCreated", "gPLink", "gPOtions", "IsDeleted",
+            "objectGUID", "nTSecurityDescriptor",
+        ],
+        needs_sd_control: true,
+    },
+    FilterConfig {
+        filter: "(objectClass=groupPolicyContainer)",
+        attrs: &[
+            "objectClass",
+            "displayName", "description", "whenCreated", "gPCFileSysPath", "IsDeleted",
+            "objectGUID", "nTSecurityDescriptor",
+        ],
+        needs_sd_control: true,
+    },
+    FilterConfig {
+        filter: "(objectClass=domain)",
+        attrs: &[
+            "objectClass",
+            "distinguishedName", "msDS-Behavior-Version", "whenCreated", "gPLink",
+            "isCriticalSystemObject", "ms-DS-MachineAccountQuota",
+            "msDS-ExpirePasswordsOnSmartCardOnlyAccounts",
+            "minPwdLength", "pwdProperties", "pwdHistoryLength", "lockoutThreshold",
+            "minPwdAge", "maxPwdAge", "lockoutDuration", "lockOutObservationWindow", "IsDeleted",
+            "objectSid", "nTSecurityDescriptor",
+        ],
+        needs_sd_control: true,
+    },
+    FilterConfig {
+        // Trusts use securityIdentifier, not nTSecurityDescriptor — SD control not needed.
+        filter: "(objectClass=trustedDomain)",
+        attrs: &[
+            "objectClass",
+            "name", "trustDirection", "trustAttributes",
+            "securityIdentifier",
+        ],
+        needs_sd_control: false,
+    },
+    FilterConfig {
+        filter: "(objectClass=container)",
+        attrs: &[
+            "objectClass",
+            "name", "description", "whenCreated", "IsDeleted",
+            "objectGUID", "nTSecurityDescriptor",
+        ],
+        needs_sd_control: true,
+    },
+    FilterConfig {
+        // FSPs have no nTSecurityDescriptor in their parser — SD control not needed.
+        filter: "(objectClass=foreignSecurityPrincipal)",
+        attrs: &[
+            "objectClass",
+            "name", "whenCreated", "objectSid", "IsDeleted",
+        ],
+        needs_sd_control: false,
+    },
+];
+
+/// Per-type configs for the Configuration naming context (AD CS objects).
+/// (objectClass=certificationAuthority) covers RootCA, AIACA, and NtAuthStore —
+/// get_type() distinguishes them by DN. (objectClass=ntAuthCertificates) is intentionally
+/// omitted: those objects have objectClass=certificationAuthority and are captured above.
+const OBFUSCATED_CONFIG_CONFIGS: &[FilterConfig] = &[
+    FilterConfig {
+        filter: "(objectClass=certificationAuthority)",
+        attrs: &[
+            "objectClass",
+            "name", "description", "whenCreated", "crossCertificatePair", "IsDeleted",
+            "objectGUID", "nTSecurityDescriptor", "cACertificate",
+        ],
+        needs_sd_control: true,
+    },
+    FilterConfig {
+        filter: "(objectClass=pKIEnrollmentService)",
+        attrs: &[
+            "objectClass",
+            "name", "description", "dNSHostName", "certificateTemplates",
+            "whenCreated", "IsDeleted",
+            "objectGUID", "nTSecurityDescriptor", "cACertificate",
+        ],
+        needs_sd_control: true,
+    },
+    FilterConfig {
+        filter: "(objectClass=pkicertificatetemplate)",
+        attrs: &[
+            "objectClass",
+            "name", "description", "displayName",
+            "msPKI-Certificate-Name-Flag", "msPKI-Enrollment-Flag",
+            "msPKI-Private-Key-Flag", "msPKI-RA-Signature",
+            "msPKI-RA-Application-Policies", "msPKI-Certificate-Application-Policy",
+            "msPKI-RA-Policies", "msPKI-Cert-Template-OID",
+            "pKIExtendedKeyUsage", "msPKI-Template-Schema-Version",
+            "whenCreated", "IsDeleted",
+            "objectGUID", "nTSecurityDescriptor", "pKIExpirationPeriod", "pKIOverlapPeriod",
+        ],
+        needs_sd_control: true,
+    },
+    FilterConfig {
+        // flags attribute required here: get_type() reads it to confirm IssuancePolicie
+        // (only objects where flags="2" are classified as IssuancePolicie, others are Unknown).
+        filter: "(objectClass=msPKI-Enterprise-Oid)",
+        attrs: &[
+            "objectClass", "flags",
+            "description", "whenCreated", "displayName", "msPKI-Cert-Template-OID", "IsDeleted",
+            "objectGUID", "nTSecurityDescriptor",
+        ],
+        needs_sd_control: true,
+    },
+];
+
+/// Sleep for a random duration in [min_ms, max_ms] to blend queries into normal AD traffic.
+async fn obfuscated_jitter(min_ms: u64, max_ms: u64) {
+    let ms = rand::thread_rng().gen_range(min_ms..=max_ms);
+    debug!("OPSEC jitter: sleeping {}ms", ms);
+    tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await;
+}
 
 /// Function to request all AD values.
 #[allow(clippy::too_many_arguments)]
@@ -39,6 +233,9 @@ pub async fn ldap_search<S: Storage<LdapSearchEntry>>(
     kerberos: bool,
     ldapfilter: &str,
     storage: &mut S,
+    obfuscated: bool,
+    jitter_min_ms: u64,
+    jitter_max_ms: u64,
 ) -> Result<usize, Box<dyn Error>> {
     // Construct LDAP args
     let ldap_args = ldap_constructor(
@@ -111,72 +308,148 @@ pub async fn ldap_search<S: Storage<LdapSearchEntry>>(
     // namingContexts: DC=domain,DC=local
     // namingContexts: CN=Configuration,DC=domain,DC=local (needed for AD CS datas)
     if res.iter().any(|s| s.contains("Configuration")) {
+        if obfuscated {
+            warn!(
+                "Obfuscated mode active — targeted per-type filters, specific attributes only, \
+                 SD control scoped per type, randomized query order and page size (100–300), \
+                 jitter {}–{}ms",
+                jitter_min_ms, jitter_max_ms
+            );
+        }
+
         for cn in &res {
-            // Set control LDAP_SERVER_SD_FLAGS_OID to get nTSecurityDescriptor
-            // https://ldapwiki.com/wiki/LDAP_SERVER_SD_FLAGS_OID
-            let ctrls = RawControl {
-                ctype: String::from("1.2.840.113556.1.4.801"),
-                crit: true,
-                val: Some(vec![48, 3, 2, 1, 5]),
-            };
-            ldap.with_controls(ctrls.to_owned());
+            if obfuscated {
+                // Choose and randomize per-type configs for this naming context so the
+                // query sequence is not fingerprint-able across repeated collections.
+                let configs: &[FilterConfig] = if cn.contains("Configuration") {
+                    OBFUSCATED_CONFIG_CONFIGS
+                } else {
+                    OBFUSCATED_MAIN_CONFIGS
+                };
 
-            // Prepare filter
-            // let mut _s_filter: &str = "";
-            // if cn.contains("Configuration") {
-            //     _s_filter = "(|(objectclass=pKIEnrollmentService)(objectclass=pkicertificatetemplate)(objectclass=subschema)(objectclass=certificationAuthority)(objectclass=container))";
-            // } else {
-            //     _s_filter = "(objectClass=*)";
-            // }
-            //let _s_filter = "(objectClass=*)";
-            //let _s_filter = "(objectGuid=*)";
-            info!("Ldap filter : {}", ldapfilter.bold().green());
-            let _s_filter = ldapfilter;
+                let mut shuffled: Vec<&FilterConfig> = configs.iter().collect();
+                shuffled.shuffle(&mut rand::thread_rng());
 
-            // Every 999 max value in ldap response (err 4 ldap)
-            let adapters: Vec<Box<dyn Adapter<_, _>>> = vec![
-                Box::new(EntriesOnly::new()),
-                Box::new(PagedResults::new(999)),
-            ];
+                let config_count = shuffled.len();
+                for (idx, config) in shuffled.iter().enumerate() {
+                    obfuscated_jitter(jitter_min_ms, jitter_max_ms).await;
 
-            // Streaming search with adaptaters and filters
-            let mut search = ldap
-                .streaming_search_with(
-                    adapters, // Adapter which fetches Search results with a Paged Results control.
-                    cn,
-                    Scope::Subtree,
-                    _s_filter,
-                    vec!["*", "nTSecurityDescriptor"],
-                    // Without the presence of this control, the server returns an SD only when the SD attribute name is explicitly mentioned in the requested attribute list.
-                    // https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-adts/932a7a8d-8c93-4448-8093-c79b7d9ba499
-                )
-                .await?;
+                    info!(
+                        "Obfuscated query [{}/{}] on {} : {}",
+                        idx + 1,
+                        config_count,
+                        cn.bold(),
+                        config.filter.bold().green()
+                    );
 
-            // Wait and get next values
-            let pb = ProgressBar::new(1);
-            let mut count = 0;
-            while let Some(entry) = search.next().await? {
-                let entry = SearchEntry::construct(entry);
-                //trace!("{:?}", &entry);
-                total += 1;
-                // Manage progress bar
-                count += 1;
-                progress_bar(
-                    pb.to_owned(),
-                    "LDAP objects retrieved".to_string(),
-                    count,
-                    "#".to_string(),
-                );
+                    if config.needs_sd_control {
+                        let ctrls = RawControl {
+                            ctype: String::from("1.2.840.113556.1.4.801"),
+                            crit: true,
+                            val: Some(vec![48, 3, 2, 1, 5]),
+                        };
+                        ldap.with_controls(ctrls.to_owned());
+                    }
 
-                storage.add(entry.into())?;
-            }
-            pb.finish_and_clear();
+                    let page_size = rand::thread_rng().gen_range(100i32..=300i32);
+                    let adapters: Vec<Box<dyn Adapter<_, _>>> = vec![
+                        Box::new(EntriesOnly::new()),
+                        Box::new(PagedResults::new(page_size)),
+                    ];
 
-            let res = search.finish().await.success();
-            match res {
-                Ok(_res) => info!("All data collected for NamingContext {}", &cn.bold()),
-                Err(err) => {
-                    error!("No data collected on {}! Reason: {err}", &cn.bold().red());
+                    let mut search = ldap
+                        .streaming_search_with(
+                            adapters,
+                            cn,
+                            Scope::Subtree,
+                            config.filter,
+                            config.attrs.to_vec(),
+                        )
+                        .await?;
+
+                    let pb = ProgressBar::new(1);
+                    let mut count = 0;
+                    while let Some(entry) = search.next().await? {
+                        let entry = SearchEntry::construct(entry);
+                        total += 1;
+                        count += 1;
+                        progress_bar(
+                            pb.to_owned(),
+                            "LDAP objects retrieved".to_string(),
+                            count,
+                            "#".to_string(),
+                        );
+                        storage.add(entry.into())?;
+                    }
+                    pb.finish_and_clear();
+
+                    let res = search.finish().await.success();
+                    match res {
+                        Ok(_) => trace!("Query complete: {} on {}", config.filter, cn),
+                        Err(err) => {
+                            error!("Query failed: {} on {}. Reason: {err}", config.filter, cn.bold().red());
+                        }
+                    }
+                }
+                info!("All data collected for NamingContext {}", &cn.bold());
+            } else {
+                // Set control LDAP_SERVER_SD_FLAGS_OID to get nTSecurityDescriptor
+                // https://ldapwiki.com/wiki/LDAP_SERVER_SD_FLAGS_OID
+                let ctrls = RawControl {
+                    ctype: String::from("1.2.840.113556.1.4.801"),
+                    crit: true,
+                    val: Some(vec![48, 3, 2, 1, 5]),
+                };
+                ldap.with_controls(ctrls.to_owned());
+
+                info!("Ldap filter : {}", ldapfilter.bold().green());
+                let _s_filter = ldapfilter;
+
+                // Every 999 max value in ldap response (err 4 ldap)
+                let adapters: Vec<Box<dyn Adapter<_, _>>> = vec![
+                    Box::new(EntriesOnly::new()),
+                    Box::new(PagedResults::new(999)),
+                ];
+
+                // Streaming search with adaptaters and filters
+                let mut search = ldap
+                    .streaming_search_with(
+                        adapters, // Adapter which fetches Search results with a Paged Results control.
+                        cn,
+                        Scope::Subtree,
+                        _s_filter,
+                        vec!["*", "nTSecurityDescriptor"],
+                        // Without the presence of this control, the server returns an SD only when the SD attribute name is explicitly mentioned in the requested attribute list.
+                        // https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-adts/932a7a8d-8c93-4448-8093-c79b7d9ba499
+                    )
+                    .await?;
+
+                // Wait and get next values
+                let pb = ProgressBar::new(1);
+                let mut count = 0;
+                while let Some(entry) = search.next().await? {
+                    let entry = SearchEntry::construct(entry);
+                    //trace!("{:?}", &entry);
+                    total += 1;
+                    // Manage progress bar
+                    count += 1;
+                    progress_bar(
+                        pb.to_owned(),
+                        "LDAP objects retrieved".to_string(),
+                        count,
+                        "#".to_string(),
+                    );
+
+                    storage.add(entry.into())?;
+                }
+                pb.finish_and_clear();
+
+                let res = search.finish().await.success();
+                match res {
+                    Ok(_res) => info!("All data collected for NamingContext {}", &cn.bold()),
+                    Err(err) => {
+                        error!("No data collected on {}! Reason: {err}", &cn.bold().red());
+                    }
                 }
             }
         }

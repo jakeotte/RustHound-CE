@@ -36,6 +36,7 @@ regex = "1"
 once_cell = "1.19"
 bincode = "2.0.1"
 obfstr = "0.4.1"
+rand = "0.8"
 
 [features]
 noargs = ["winreg"] # Only available for Windows

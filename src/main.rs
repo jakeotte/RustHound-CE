@@ -85,6 +85,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     common_args.kerberos,
                     &common_args.ldap_filter,
                     &mut cache_writer,
+                    common_args.obfuscated,
+                    common_args.jitter_min_ms,
+                    common_args.jitter_max_ms,
                 )
                 .await?;
 
@@ -108,6 +111,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     common_args.kerberos,
                     &common_args.ldap_filter,
                     &mut ldap_results,
+                    common_args.obfuscated,
+                    common_args.jitter_min_ms,
+                    common_args.jitter_max_ms,
                 )
                 .await?;
                 rusthound_ce::prepare_results_from_source(ldap_results, &common_args, Some(total))
