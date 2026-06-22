@@ -1,76 +1,35 @@
-<p align="center">
-    <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="https://github.com/g0h4n/RustHound-CE/raw/main/img/rusthoundce-transparent-dark-theme.png">
-        <source media="(prefers-color-scheme: light)" srcset="https://github.com/g0h4n/RustHound-CE/raw/main/img/rusthoundce-transparent-light-theme.png">
-        <img src="https://github.com/g0h4n/RustHound-CE/raw/main/img/rusthoundce-transparent-dark-theme.png" alt="rusthound-ce logo" width='250' />
-    </picture>
-</p>
+# RustHound-CE (obfuscation fork)
 
-<hr />
+Fork of [g0h4n/RustHound-CE](https://github.com/g0h4n/RustHound-CE) focused on OPSEC-safe BloodHound collection.
 
-RustHound-CE is a cross-platform and cross-compiled BloodHound collector tool written in Rust, making it compatible with Linux, Windows, and macOS. It therefore generates all the JSON files that can be analyzed by BloodHound Community Edition. This version is only compatible with [BloodHound Community Edition](https://github.com/SpecterOps/BloodHound). The version compatible with [BloodHound Legacy](https://github.com/BloodHoundAD/BloodHound) can be found on [NeverHack's github](https://github.com/NH-RED-TEAM/RustHound).
+## What's different
 
-RustHound was created during my years as a pentester at Armature Technologies, renamed later Opencyber then NeverHack. I would like to thanks NeverHack for giving me time to research and develop the original RustHound project, which is still available on their github. We've decided to continue working together to contribute to both versions. This one will remain compatible with the community edition, and the NeverHack version with the Legacy version of BloodHound.
+`--obfuscated` flag replaces the standard broad LDAP query with targeted per-type queries designed to avoid common detection signatures:
 
-- [HELP.md](HELP.md) - How to compile it? How to install it? How to use it?
-- [CHANGELOG.md](CHANGELOG.md) - A record of all significant version changes
-- [ROADMAP.md](ROADMAP.md) - List of planned evolutions
-- [LINKS.md](LINKS.md) - Useful resources
-
-# Quick usage
-
-## Compilation
-
-This project can be compiled directly from `make` command like:
-
-```bash
-# Compile it for your current system
-make release
-# Compile it for Windows
-make windows
-```
-
-Or using `docker` like below:
-
-```bash
-docker build --rm -t rusthound-ce .
-
-# Then
-docker run --rm -v $PWD:/usr/src/rusthound-ce rusthound-ce help
-docker run --rm -v $PWD:/usr/src/rusthound-ce rusthound-ce release
-docker run --rm -v $PWD:/usr/src/rusthound-ce rusthound-ce windows
-docker run --rm -v $PWD:/usr/src/rusthound-ce rusthound-ce linux
-```
-
-## Installation
-
-<a href="https://crates.io/crates/rusthound-ce"><img alt="Crates.io Version" src="https://img.shields.io/crates/v/rusthound-ce"> <img alt="Crates.io Total Downloads" src="https://img.shields.io/crates/d/rusthound-ce?color=f74c00"></a>
-
-Make sure the [required dependencies](https://github.com/g0h4n/RustHound-CE/blob/main/HELP.md#required-dependencies) are installed.
-
-```bash
-# Install and/or update RustHound-CE from cargo command
-cargo install rusthound-ce
-```
+- Specific attribute lists per object type instead of `*`
+- Non-overlapping filters — no object appears in two result sets
+- SD control scoped only to types that parse `nTSecurityDescriptor`
+- Randomized query order per run
+- Randomized page size (100–300) per query
+- Random jitter between queries (`--jitter-min` / `--jitter-max`, default 500–3000ms)
 
 ## Usage
 
-Here's an example of a command to collect domain objects and obtain the zip archive containing the json files to be imported into BloodHound CE:
-
 ```bash
-rusthound-ce -d DOMAIN.LOCAL -u USERNAME@DOMAIN.LOCAL -z
+# Standard collection
+rusthound-ce -d DOMAIN.LOCAL -u user@domain.local -p 'pass' -z
+
+# OPSEC-safe collection
+rusthound-ce -d DOMAIN.LOCAL -u user@domain.local -p 'pass' -z --obfuscated
+
+# Tune jitter (milliseconds)
+rusthound-ce -d DOMAIN.LOCAL -u user@domain.local -p 'pass' -z --obfuscated --jitter-min 1000 --jitter-max 5000
 ```
 
-More information and examples with how to compile RustHound-CE or how to use RustHound-CE can be found directly on the [help page](HELP.md).
+## Build
 
-# Special thanks to 
-
-[![](https://github.com/NH-RED-TEAM.png?size=50)](https://github.com/NH-RED-TEAM)
-[![](https://github.com/f3rn0s.png?size=50)](https://github.com/f3rn0s)
-[![](https://github.com/barney0.png?size=50)](https://github.com/barney0)
-[![](https://github.com/Mayfly277.png?size=50)](https://github.com/Mayfly277)
-[![](https://github.com/spyr0-sec.png?size=50)](https://github.com/spyr0-sec)
-[![](https://github.com/z-jxy.png?size=50)](https://github.com/z-jxy)
-[![](https://github.com/0xdf223.png?size=50)](https://github.com/0xdf223)
-[<img src="https://pbs.twimg.com/profile_images/859140652617142272/z79HkNvx_400x400.jpg" alt="IppSec" width="50"/>](https://github.com/IppSec)
-[![](https://github.com/aancw.png?size=50)](https://github.com/aancw)
+```bash
+make release
+# or
+cargo build --release --no-default-features --features nogssapi  # macOS
+```
